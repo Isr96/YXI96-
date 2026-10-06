@@ -1,0 +1,625 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="theme-color" content="#ffffff">
+<title>Insecto</title>
+<style>
+  html, body {
+    margin: 0;
+    background: #fff;
+    overflow: hidden;
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    touch-action: none;
+    -webkit-user-select: none;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  canvas {
+    position: fixed;
+    left: 0;
+    top: 0;
+    touch-action: none;
+    display: block;
+  }
+  #hint {
+    position: fixed;
+    left: 16px;
+    right: 16px;
+    bottom: calc(20px + env(safe-area-inset-bottom));
+    margin: 0;
+    text-align: center;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 17px;
+    line-height: 1.35;
+    letter-spacing: 0.01em;
+    color: #8d8d8d;
+    pointer-events: none;
+    z-index: 2;
+    transition: opacity 0.7s ease;
+  }
+  #hint.hide { opacity: 0; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<p id="hint">Toca para que camine</p>
+<script>
+(function () {
+  const canvas = document.getElementById("c");
+  const ctx = canvas.getContext("2d", { alpha: false });
+  const hint = document.getElementById("hint");
+
+  const TAU = Math.PI * 2;
+  const ROOT_ID = 13;
+
+  let rig = null;
+  let images = {};
+  let view = { w: 1, h: 1, dpr: 1, scale: 0.2, cx: 0, cy: 0 };
+
+  let rootPos = [0, 0];
+  let heading = 0;
+  let target = null;
+  let hasTapped = false;
+  let time = 0;
+  let gait = 0;
+  let speed01 = 0;
+  let marked = null;
+
+  const pivotOf = {};
+  const children = {};
+  const partMeta = {};
+  let legRt = [];
+
+  const worldPivot = new Map();
+  const worldRot = new Map();
+
+  function wrap(a) {
+    a = (a + Math.PI) % TAU;
+    if (a < 0) a += TAU;
+    return a - Math.PI;
+  }
+  function clamp(v, a, b) { return v < a ? a : v > b ? b : v; }
+  function lerp(a, b, t) { return a + (b - a) * t; }
+  function dist(a, b) {
+    const dx = a[0] - b[0], dy = a[1] - b[1];
+    return Math.hypot(dx, dy);
+  }
+  function add(a, b) { return [a[0] + b[0], a[1] + b[1]]; }
+  function sub(a, b) { return [a[0] - b[0], a[1] - b[1]]; }
+  function mul(a, s) { return [a[0] * s, a[1] * s]; }
+  function rot(p, a) {
+    const c = Math.cos(a), s = Math.sin(a);
+    return [p[0] * c - p[1] * s, p[0] * s + p[1] * c];
+  }
+  function ease(t) { return 1 - Math.pow(1 - t, 2.15); }
+
+  function computeScale(w, h) {
+    const fitW = (w * 0.84) / 1500;
+    const fitH = (h * 0.5) / 1020;
+    return Math.min(fitW, fitH, 0.38);
+  }
+
+  function resize() {
+    const vv = window.visualViewport;
+    const w = Math.round(vv ? vv.width : window.innerWidth);
+    const h = Math.round(vv ? vv.height : window.innerHeight);
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    view.w = w;
+    view.h = h;
+    view.dpr = dpr;
+    view.scale = computeScale(w, h);
+    view.cx = w * 0.5;
+    view.cy = h * 0.46;
+    canvas.style.width = w + "px";
+    canvas.style.height = h + "px";
+    canvas.width = Math.round(w * dpr);
+    canvas.height = Math.round(h * dpr);
+  }
+
+  function screenToWorld(sx, sy) {
+    const s = view.scale;
+    const rp = rig.rootPivot;
+    return [
+      rp[0] + (sx - view.cx) / s,
+      rp[1] + (sy - view.cy) / s
+    ];
+  }
+
+  function loadImage(src) {
+    return new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = src;
+    });
+  }
+
+  function buildRuntime() {
+    const rp = rig.rootPivot;
+    pivotOf[ROOT_ID] = rp.slice();
+    children[ROOT_ID] = [];
+    for (const bone of rig.bones.concat(rig.extras)) {
+      pivotOf[bone.id] = bone.onChild.slice();
+      if (!children[bone.parent]) children[bone.parent] = [];
+      children[bone.parent].push(bone);
+    }
+    for (const [id, meta] of Object.entries(rig.parts)) {
+      partMeta[id] = meta;
+    }
+    legRt = rig.legs.map((leg, index) => {
+      const setB = (leg.pair % 2 === 0) ? leg.side === 1 : leg.side === -1;
+      const rel = leg.segments.map((seg, i) => {
+        if (i === 0) return 0;
+        return wrap(seg.restAngle - leg.segments[i - 1].restAngle);
+      });
+      return {
+        index,
+        spec: leg,
+        rel,
+        phase: (setB ? 0.5 : 0) + leg.pair * 0.055,
+        angles: leg.segments.map(() => 0),
+        swinging: false,
+        swingT: 0,
+        swingDur: 0.24,
+        from: null,
+        to: null,
+        plant: leg.restFoot.slice(),
+        foot: leg.restFoot.slice()
+      };
+    });
+    rootPos = rp.slice();
+  }
+
+  function partnerOf(i) {
+    const a = legRt[i];
+    for (let j = 0; j < legRt.length; j++) {
+      if (j === i) continue;
+      const b = legRt[j];
+      if (b.spec.pair === a.spec.pair && b.spec.side !== a.spec.side) return j;
+    }
+    return -1;
+  }
+
+  function placeBody(visualHeading) {
+    worldPivot.clear();
+    worldRot.clear();
+    const lat = (26 + speed01 * 18) * Math.sin(gait * TAU);
+    const side = rot([0, 1], visualHeading);
+    worldPivot.set(ROOT_ID, add(rootPos, mul(side, lat)));
+    worldRot.set(ROOT_ID, visualHeading);
+
+    function walk(id) {
+      const parentRot = worldRot.get(id);
+      const parentPivot = worldPivot.get(id);
+      const parentImg = pivotOf[id];
+      const kids = children[id] || [];
+      for (const bone of kids) {
+        const wave = bone._wave || 0;
+        const anchor = add(parentPivot, rot(sub(bone.onParent, parentImg), parentRot));
+        const childRot = parentRot + wave;
+        const childPivot = add(anchor, rot(sub(bone.onChild, bone.onParent), childRot));
+        worldPivot.set(bone.id, childPivot);
+        worldRot.set(bone.id, childRot);
+        walk(bone.id);
+      }
+    }
+    walk(ROOT_ID);
+  }
+
+  function assignWaves(look) {
+    const all = rig.bones.concat(rig.extras);
+    for (const bone of all) bone._wave = 0;
+    const amp = 0.028 + speed01 * 0.055;
+    const tail = [14, 16, 17, 21, 23, 25];
+    for (let i = 0; i < tail.length; i++) {
+      const bone = rig.bones.find((b) => b.id === tail[i]);
+      if (!bone) continue;
+      const grow = 0.45 + i * 0.22;
+      bone._wave = Math.sin(gait * TAU - i * 0.72) * amp * grow;
+    }
+    const neck = rig.bones.find((b) => b.id === 15);
+    const collar = rig.bones.find((b) => b.id === 22);
+    const head = rig.bones.find((b) => b.id === 19);
+    if (neck) neck._wave = -Math.sin(gait * TAU) * (0.012 + speed01 * 0.02);
+    if (collar) collar._wave = Math.sin(gait * TAU * 2 + 0.4) * 0.03;
+    if (head) head._wave = clamp(look, -0.55, 0.55) * 0.72;
+
+    const bite = 0.04 + (speed01 < 0.08 ? 0.11 * (0.5 + 0.5 * Math.sin(time * 2.1)) : 0.05 * Math.sin(gait * TAU * 2));
+    for (const extra of rig.extras) {
+      if (extra.kind === "mandible") {
+        const childBoost = extra.parent === 20 || extra.parent === 27 ? 0.65 : 1;
+        extra._wave = extra.openSign * bite * childBoost;
+      } else if (extra.kind === "palp") {
+        extra._wave = extra.openSign * Math.sin(time * 4.6 + (extra.id === 29 ? 0.7 : 0)) * 0.14;
+      }
+    }
+  }
+
+  function bodyTransformPoint(bodyId, imagePoint) {
+    const rotA = worldRot.get(bodyId) || 0;
+    const piv = worldPivot.get(bodyId);
+    const img = pivotOf[bodyId];
+    return add(piv, rot(sub(imagePoint, img), rotA));
+  }
+
+  function hipOf(leg) {
+    const bodyId = leg.spec.body;
+    const anchor = bodyTransformPoint(bodyId, leg.spec.hipOnBody);
+    const bodyR = worldRot.get(bodyId) || 0;
+    const coxa = leg.spec.segments[0].pivot;
+    return add(anchor, rot(sub(coxa, leg.spec.hipOnBody), bodyR));
+  }
+
+  function chainPoints(leg, hip, angles) {
+    const segs = leg.spec.segments;
+    const bodyR = worldRot.get(leg.spec.body) || 0;
+    const pts = [hip];
+    const angs = [];
+    for (let i = 0; i < segs.length; i++) {
+      let ang;
+      if (i === 0) ang = segs[0].restAngle + bodyR + angles[0];
+      else ang = angs[i - 1] + leg.rel[i] + angles[i];
+      angs[i] = ang;
+      const p = pts[i];
+      pts.push([
+        p[0] + Math.cos(ang) * segs[i].length,
+        p[1] + Math.sin(ang) * segs[i].length
+      ]);
+    }
+    return { pts, angs };
+  }
+
+  function keepOnSide(leg, foot) {
+    const forward = [Math.cos(heading), Math.sin(heading)];
+    const rel = sub(foot, rootPos);
+    const cross = forward[0] * rel[1] - forward[1] * rel[0];
+    const minLat = 90;
+    if (cross * leg.spec.side >= minLat) return foot;
+    const along = forward[0] * rel[0] + forward[1] * rel[1];
+    const sideDir = [-forward[1], forward[0]];
+    return add(add(rootPos, mul(forward, along)), mul(sideDir, leg.spec.side * minLat));
+  }
+
+  function solveIk(leg, hip, target) {
+    const segs = leg.spec.segments;
+    const n = segs.length;
+    const lengths = segs.map((s) => s.length);
+    const total = lengths.reduce((a, b) => a + b, 0);
+    let pts = chainPoints(leg, hip, leg.angles).pts.map((p) => p.slice());
+    const gap = dist(hip, target);
+    if (gap >= total * 0.995) {
+      const dir = mul(sub(target, hip), 1 / Math.max(gap, 0.001));
+      pts[0] = hip.slice();
+      for (let i = 0; i < n; i++) pts[i + 1] = add(pts[i], mul(dir, lengths[i]));
+    } else {
+      for (let it = 0; it < 6; it++) {
+        pts[n] = target.slice();
+        for (let i = n - 1; i >= 0; i--) {
+          const delta = sub(pts[i], pts[i + 1]);
+          const len = Math.hypot(delta[0], delta[1]) || 1;
+          pts[i] = add(pts[i + 1], mul(delta, lengths[i] / len));
+        }
+        pts[0] = hip.slice();
+        for (let i = 0; i < n; i++) {
+          const delta = sub(pts[i + 1], pts[i]);
+          const len = Math.hypot(delta[0], delta[1]) || 1;
+          pts[i + 1] = add(pts[i], mul(delta, lengths[i] / len));
+        }
+      }
+    }
+    const bodyR = worldRot.get(leg.spec.body) || 0;
+    const angles = new Array(n);
+    let prev = 0;
+    for (let i = 0; i < n; i++) {
+      const ang = Math.atan2(pts[i + 1][1] - pts[i][1], pts[i + 1][0] - pts[i][0]);
+      if (i === 0) angles[0] = wrap(ang - (segs[0].restAngle + bodyR));
+      else angles[i] = wrap(wrap(ang - prev) - leg.rel[i]);
+      prev = ang;
+    }
+    return angles;
+  }
+
+  function predictLanding(leg, hip) {
+    const ideal = bodyTransformPoint(leg.spec.body, leg.spec.restFoot);
+    const ahead = 90 + speed01 * 160;
+    const dir = [Math.cos(heading), Math.sin(heading)];
+    let land = add(ideal, mul(dir, ahead * 0.15));
+    const reach = leg.spec.segments.reduce((s, seg) => s + seg.length, 0);
+    const d = dist(hip, land);
+    if (d > reach * 0.92) {
+      land = add(hip, mul(sub(land, hip), (reach * 0.92) / d));
+    }
+    return land;
+  }
+
+  function updateLegs(dt) {
+    let swinging = 0;
+    for (const leg of legRt) if (leg.swinging) swinging++;
+
+    for (let i = 0; i < legRt.length; i++) {
+      const leg = legRt[i];
+      const hip = hipOf(leg);
+      const ideal = bodyTransformPoint(leg.spec.body, leg.spec.restFoot);
+      const reach = leg.spec.segments.reduce((s, seg) => s + seg.length, 0);
+
+      if (leg.swinging) {
+        leg.swingT += dt;
+        const t = clamp(leg.swingT / leg.swingDur, 0, 1);
+        const fresh = predictLanding(leg, hip);
+        leg.to = add(mul(leg.to, 0.82), mul(fresh, 0.18));
+        const e = ease(t);
+        let foot = add(mul(leg.from, 1 - e), mul(leg.to, e));
+        const outward = rot([0, leg.spec.side], heading);
+        const arc = Math.sin(Math.PI * t) * (34 + speed01 * 28);
+        foot = add(foot, mul(outward, arc));
+        foot = add(mul(foot, 1), mul(hip, 0));
+        const tuck = Math.sin(Math.PI * t) * 0.1;
+        foot = add(mul(foot, 1 - tuck), mul(hip, tuck));
+        leg.foot = foot;
+        if (t >= 1) {
+          leg.swinging = false;
+          leg.plant = foot.slice();
+          leg.foot = leg.plant.slice();
+        }
+      } else if (speed01 < 0.05 && !target) {
+        leg.plant = add(mul(leg.plant, 0.9), mul(ideal, 0.1));
+        leg.foot = leg.plant.slice();
+        for (let k = 0; k < leg.angles.length; k++) leg.angles[k] *= 0.86;
+      } else {
+        leg.foot = leg.plant.slice();
+        const err = dist(leg.plant, ideal);
+        const stretch = dist(hip, leg.plant) / reach;
+        const phase = ((gait + leg.phase) % 1 + 1) % 1;
+        const partner = partnerOf(i);
+        const partnerSwing = partner >= 0 && legRt[partner].swinging;
+        const windowOpen = phase < 0.38;
+        const want = (windowOpen && err > 110 && speed01 > 0.04) || stretch > 0.9 || err > 220;
+        if (want && !partnerSwing && swinging < 4 && (speed01 > 0.03 || err > 80)) {
+          leg.swinging = true;
+          leg.swingT = 0;
+          leg.swingDur = lerp(0.28, 0.16, speed01);
+          leg.from = leg.plant.slice();
+          leg.to = predictLanding(leg, hip);
+          swinging++;
+          leg.foot = leg.from.slice();
+        }
+      }
+
+      const solved = solveIk(leg, hip, keepOnSide(leg, leg.foot));
+      const curl = leg.swinging ? Math.sin(Math.PI * clamp(leg.swingT / leg.swingDur, 0, 1)) : 0;
+      for (let k = 0; k < solved.length; k++) {
+        let a = solved[k];
+        if (k === solved.length - 1 && curl) {
+          const sign = Math.sign(leg.rel[k] || leg.spec.side);
+          a += sign * curl * 0.22;
+        }
+        leg.angles[k] = a;
+      }
+      leg._hip = hip;
+      leg._draw = chainPoints(leg, hip, leg.angles);
+    }
+  }
+
+  function steer(dt) {
+    if (!target) {
+      speed01 = lerp(speed01, 0, 1 - Math.exp(-dt * 4));
+      gait += dt * 0.35;
+      return 0;
+    }
+    const to = sub(target, rootPos);
+    const d = Math.hypot(to[0], to[1]);
+    const arrive = 36 / view.scale;
+    if (d < arrive) {
+      target = null;
+      speed01 = lerp(speed01, 0, 1 - Math.exp(-dt * 6));
+      gait += dt * (0.35 + speed01);
+      return 0;
+    }
+    const desired = Math.atan2(to[1], to[0]);
+    const diff = wrap(desired - heading);
+    const maxTurn = 3.4 * dt;
+    heading += clamp(diff, -maxTurn, maxTurn);
+    const align = Math.cos(diff);
+    let throttle = clamp(d / (220 / view.scale), 0.2, 1);
+    let spd = (118 / view.scale) * clamp(align, 0, 1) * throttle;
+    if (Math.abs(diff) > 0.9) spd *= 0.42;
+    const stepX = Math.cos(heading) * spd * dt;
+    const stepY = Math.sin(heading) * spd * dt;
+    rootPos[0] += stepX;
+    rootPos[1] += stepY;
+    const margin = 28;
+    const min = screenToWorld(margin, margin);
+    const max = screenToWorld(view.w - margin, view.h - margin);
+    rootPos[0] = clamp(rootPos[0], Math.min(min[0], max[0]), Math.max(min[0], max[0]));
+    rootPos[1] = clamp(rootPos[1], Math.min(min[1], max[1]), Math.max(min[1], max[1]));
+    const screenSpd = spd * view.scale;
+    speed01 = lerp(speed01, clamp(screenSpd / 118, 0, 1), 1 - Math.exp(-dt * 6));
+    gait += dt * (0.55 + speed01 * 1.15);
+    return diff;
+  }
+
+  function drawPart(id, spriteRot) {
+    const img = images[id];
+    const meta = partMeta[id];
+    const piv = worldPivot.get(Number(id));
+    if (!img || !meta || !piv) return;
+    const crop = meta.crop;
+    const p = pivotOf[id];
+    ctx.save();
+    ctx.translate(piv[0], piv[1]);
+    ctx.rotate(spriteRot || 0);
+    ctx.drawImage(img, -(p[0] - crop[0]), -(p[1] - crop[1]));
+    ctx.restore();
+  }
+
+  function drawLeg(leg) {
+    const segs = leg.spec.segments;
+    const draw = leg._draw;
+    if (!draw) return;
+    for (let i = 0; i < segs.length; i++) {
+      const id = segs[i].id;
+      const img = images[id];
+      const meta = partMeta[id];
+      if (!img || !meta) continue;
+      const crop = meta.crop;
+      const p = segs[i].pivot;
+      const spriteRot = draw.angs[i] - segs[i].restAngle;
+      ctx.save();
+      ctx.translate(draw.pts[i][0], draw.pts[i][1]);
+      ctx.rotate(spriteRot);
+      ctx.drawImage(img, -(p[0] - crop[0]), -(p[1] - crop[1]));
+      ctx.restore();
+    }
+  }
+
+  function frame(dt) {
+    const look = steer(dt);
+    const bob = Math.sin(gait * TAU) * (0.02 + speed01 * 0.035);
+    assignWaves(look);
+    placeBody(heading + bob);
+    updateLegs(dt);
+
+    const dpr = view.dpr;
+    const s = view.scale;
+    const rp = rig.rootPivot;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.fillStyle = "#ffffff";
+    ctx.fillRect(0, 0, view.w, view.h);
+
+    ctx.setTransform(
+      dpr * s, 0, 0, dpr * s,
+      dpr * (view.cx - rp[0] * s),
+      dpr * (view.cy - rp[1] * s)
+    );
+
+    const shadowAt = worldPivot.get(ROOT_ID) || rootPos;
+    ctx.save();
+    ctx.translate(shadowAt[0], shadowAt[1] + 30);
+    ctx.rotate(heading);
+    ctx.fillStyle = "rgba(0,0,0,0.07)";
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 250, 120, 0, 0, TAU);
+    ctx.fill();
+    ctx.restore();
+
+    for (const leg of legRt) drawLeg(leg);
+
+    const bodyOrder = [25, 23, 21, 17, 16, 14, 13, 15, 22, 19, 18, 29, 20, 24, 27, 26];
+    for (const id of bodyOrder) {
+      if (worldRot.has(id)) drawPart(id, worldRot.get(id));
+    }
+
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    if (marked && target) {
+      const mx = view.cx + (marked[0] - rp[0]) * s;
+      const my = view.cy + (marked[1] - rp[1]) * s;
+      ctx.beginPath();
+      ctx.arc(mx, my, 16, 0, TAU);
+      ctx.strokeStyle = "rgba(0,0,0,0.45)";
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.beginPath();
+      ctx.arc(mx, my, 3, 0, TAU);
+      ctx.fillStyle = "rgba(0,0,0,0.55)";
+      ctx.fill();
+    }
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000);
+    last = now;
+    time += dt;
+    if (rig) frame(dt);
+    requestAnimationFrame(loop);
+  }
+
+  function setTargetFromEvent(ev) {
+    const r = canvas.getBoundingClientRect();
+    const sx = ev.clientX - r.left;
+    const sy = ev.clientY - r.top;
+    if (sx < 0 || sy < 0 || sx > r.width || sy > r.height) return;
+    target = screenToWorld(sx, sy);
+    marked = target.slice();
+    hasTapped = true;
+    hint.classList.add("hide");
+  }
+
+  canvas.addEventListener("pointerdown", (ev) => {
+    canvas.setPointerCapture && canvas.setPointerCapture(ev.pointerId);
+    setTargetFromEvent(ev);
+  });
+  window.addEventListener("pointerdown", (ev) => {
+    if (ev.target === canvas) return;
+    setTargetFromEvent(ev);
+  });
+  window.addEventListener("touchmove", (ev) => ev.preventDefault(), { passive: false });
+  window.addEventListener("gesturestart", (ev) => ev.preventDefault());
+
+  window.addEventListener("resize", resize);
+  if (window.visualViewport) {
+    window.visualViewport.addEventListener("resize", resize);
+    window.visualViewport.addEventListener("scroll", resize);
+  }
+
+  window.__bug = {
+    tap(x, y) {
+      target = screenToWorld(x, y);
+      marked = target.slice();
+      hasTapped = true;
+      hint.classList.add("hide");
+    },
+    state() {
+      return {
+        heading,
+        root: rootPos.slice(),
+        speed01,
+        target: target && target.slice(),
+        swinging: legRt.filter((l) => l.swinging).length,
+        legs: legRt.map((l) => ({
+          ids: l.spec.segments.map((s) => s.id),
+          swinging: l.swinging,
+          angles: l.angles.map((a) => Math.round(a * 100) / 100),
+          tipErr: l._draw ? Math.round(dist(l._draw.pts[l._draw.pts.length - 1], l.foot)) : null
+        }))
+      };
+    }
+  };
+
+  resize();
+
+  const params = new URLSearchParams(location.search);
+  const boot = window.__EMBEDDED_RIG
+    ? Promise.resolve(window.__EMBEDDED_RIG)
+    : fetch("rig.json").then((r) => r.json());
+  boot
+    .then(async (data) => {
+      rig = data;
+      buildRuntime();
+      await Promise.all(Object.entries(rig.parts).map(async ([id, meta]) => {
+        images[id] = await loadImage(meta.src);
+      }));
+      if (params.get("demo") === "1") {
+        const p = screenToWorld(view.w * 0.82, view.h * 0.78);
+        target = p;
+        marked = p.slice();
+        hint.classList.add("hide");
+      }
+      requestAnimationFrame(loop);
+    })
+    .catch((err) => {
+      hint.textContent = "No se pudo abrir el insecto";
+      console.error(err);
+    });
+})();
+</script>
+</body>
+</html>
