@@ -1,5 +1,7 @@
 # YXI96 Mira
 
+Abre **YXI96Mira.exe**. Doble clic. No hace falta instalar nada.
+
 Punto de mira encima de la pantalla, para shooters. La mira vive en su propia ventana: siempre delante, con el fondo transparente, y el clic la atraviesa hasta el juego.
 
 ## Qué se puede ajustar
